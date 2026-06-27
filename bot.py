@@ -1,29 +1,21 @@
 import os
+import asyncio
 import logging
+from typing import Any, Final
 from datetime import datetime, timedelta
-from typing import Final, Any, NoReturn
-import requests
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
+import httpx
+
 from telegram import Update, User, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    ContextTypes,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ConversationHandler,
-    filters
-)
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.FileHandler("app.log", encoding="utf-8"),
-        logging.StreamHandler()
-    ]
+    ContextTypes,
+    filters,
 )
 
 
@@ -32,157 +24,100 @@ BOT_TOKEN: Final[str | None] = os.getenv("TELEGRAM_BOT_TOKEN")
 WEATHER_API_KEY: Final[str | None] = os.getenv("API_KEY")
 EXCHANGE_API_KEY: Final[str | None] = os.getenv("EXCHANGE_API_KEY")
 
-
 AWAITING_CITY: Final[int] = 1
-
-
 DATA_CACHE: dict[str, dict[str, Any]] = {}
 CACHE_TTL_MINUTES: Final[int] = 10
 
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+
+flask_app = Flask(__name__)
+
+
+app = Application.builder().token(BOT_TOKEN).build()
+
+
 def get_cached_data(cache_key: str) -> Any | None:
-    """Перевіряє наявність даних у кеші та їхню актуальність (до 10 хвилин)."""
     if cache_key in DATA_CACHE:
         cache_entry = DATA_CACHE[cache_key]
-        now = datetime.now()
-        if now - cache_entry["timestamp"] < timedelta(minutes=CACHE_TTL_MINUTES):
-            logging.info(f"💾 Використано дані з кешу для ключа: {cache_key}")
+        if datetime.now() - cache_entry["timestamp"] < timedelta(minutes=CACHE_TTL_MINUTES):
+            logging.info(f"💾 Кеш активовано для: {cache_key}")
             return cache_entry["data"]
     return None
 
 
 def set_cache_data(cache_key: str, data: Any) -> None:
-    """Зберігає отримані дані в кеш із міткою поточного часу."""
-    DATA_CACHE[cache_key] = {
-        "timestamp": datetime.now(),
-        "data": data
-    }
-    logging.info(f"📥 Нові дані успішно збережено в кеш для ключа: {cache_key}")
-
-
-async def clear_expired_cache_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фонова задача (Job), яка перевіряє кеш та видаляє застарілі записи (>10 хв)."""
-    logging.info("🧹 Запуск фонового очищення застарілого кешу...")
-    now = datetime.now()
-    keys_to_delete = []
-
-    for key, cache_entry in DATA_CACHE.items():
-        if now - cache_entry["timestamp"] >= timedelta(minutes=CACHE_TTL_MINUTES):
-            keys_to_delete.append(key)
-
-    for key in keys_to_delete:
-        del DATA_CACHE[key]
-        logging.info(f"🗑️ Видалено застарілий ключ із кешу: {key}")
-
-    if keys_to_delete:
-        logging.info(f"✅ Фонову очистку завершено. Очищено елементів: {len(keys_to_delete)}")
-    else:
-        logging.info("✅ Фонову очистку завершено. Застарілих елементів не знайдено.")
+    DATA_CACHE[cache_key] = {"timestamp": datetime.now(), "data": data}
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Надсилає користувачеві вітальне повідомлення та головне меню у вигляді кнопок."""
     user: User | None = update.effective_user
-    if user:
-        logging.info(f"Користувач {user.first_name} (ID: {user.id}) запустив бота")
-
     keyboard = [
-        [
-            InlineKeyboardButton("⛅ Київ", callback_data="weather:Київ"),
-            InlineKeyboardButton("⛅ Одеса", callback_data="weather:Одеса"),
-            InlineKeyboardButton("⛅ Львів", callback_data="weather:Львів")
-        ],
-        [
-            InlineKeyboardButton("💵 Курс USD до UAH", callback_data="currency:USD"),
-            InlineKeyboardButton("💶 Курс EUR до UAH", callback_data="currency:EUR")
-        ]
+        [InlineKeyboardButton("⛅ Київ", callback_data="weather:Київ"),
+         InlineKeyboardButton("⛅ Одеса", callback_data="weather:Одеса"),
+         InlineKeyboardButton("⛅ Львів", callback_data="weather:Львів")],
+        [InlineKeyboardButton("💵 Курс USD", callback_data="currency:USD"),
+         InlineKeyboardButton("💶 Курс EUR", callback_data="currency:EUR")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
-    greeting = (
-        f"👋 Привіт, {user.first_name if user else 'гостю'}!\n"
-        "Я твій універсальний асистент погоди та фінансів.\n\n"
-        "Оберіть місто або валюту нижче на кнопках для миттєвого результату, "
-        "або скористайтеся командою /weather для ручного пошуку міста."
-    )
+    greeting = f"👋 Привіт, {user.first_name if user else 'гостю'}!\nОберіть дію нижче:"
     if update.message:
         await update.message.reply_text(greeting, reply_markup=reply_markup)
 
 
 async def weather_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ініціює ручний запит погоди."""
     if update.message:
-        await update.message.reply_text("🌍 Будь ласка, введіть назву міста вручну (наприклад, Харків):")
+        await update.message.reply_text("🌍 Введіть назву міста:")
     return AWAITING_CITY
 
 
-def fetch_weather_from_api(city_name: str) -> dict[str, Any] | str:
-    """Запитує погодні дані або повертає рядок помилки."""
+async def fetch_weather_from_api(city_name: str) -> dict[str, Any] | str:
     url = "https://openweathermap.org"
     params = {"q": city_name, "appid": WEATHER_API_KEY, "units": "metric", "lang": "ua"}
-
-    response = requests.get(url, params=params)
-    if response.status_code != 200:
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, params=params, timeout=10.0)
+            return response.json() if response.status_code == 200 else "not_found"
+    except Exception:
         return "not_found"
-    return response.json()
 
 
 async def handle_weather_logic(city_name: str) -> str:
-    """Обробляє логіку отримання погоди з урахуванням 10-хвилинного кешу."""
     cache_key = f"weather:{city_name.lower()}"
     cached_res = get_cached_data(cache_key)
-    is_cached = False
+    is_cached = bool(cached_res)
 
-    if cached_res:
-        data = cached_res
-        is_cached = True
-    else:
-        data = fetch_weather_from_api(city_name)
-        if data == "not_found":
-            return "❌ Місто не знайдено або сталася помилка API. Перевірте назву."
+    data = cached_res if is_cached else await fetch_weather_from_api(city_name)
+    if data == "not_found":
+        return "❌ Місто не знайдено або помилка API."
+
+    if not is_cached:
         set_cache_data(cache_key, data)
 
-    temp = data["main"]["temp"]
-    description = data["weather"]["description"].capitalize()
-    humidity = data["main"]["humidity"]
-    wind_speed = data["wind"]["speed"]
-    drink_time = (datetime.now() + timedelta(hours=1)).strftime("%H:%M")
-
-    cache_tag = " ⚠️ *(Оновлено з кешу)*" if is_cached else ""
-
-    return (
-        f"🌡️ **Погода в місті {city_name}{cache_tag}:**\n"
-        f"• Температура: {temp}°C\n"
-        f"• Стан: {description}\n"
-        f"• Вологість: {humidity}%\n"
-        f"• Швидкість вітру: {wind_speed} м/с\n\n"
-        f"🔔 *Нагадування:* Не забудьте випити склянку води о **{drink_time}**!"
-    )
+    try:
+        temp = data["main"]["temp"]
+        description = data["weather"][0]["description"].capitalize()
+        cache_tag = " ⚠️ *(З кешу)*" if is_cached else ""
+        return f"🌡️ **Погода в {city_name}{cache_tag}:**\n• Температура: {temp}°C\n• Стан: {description}"
+    except Exception:
+        return "❌ Помилка обробки даних погоди."
 
 
 async def process_weather(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Обробляє текстове повідомлення з назвою міста від користувача."""
-    if not update.message or not update.message.text:
-        return ConversationHandler.END
-
-    city_name = update.message.text.strip()
-    result_message = await handle_weather_logic(city_name)
-
-    await update.message.reply_text(result_message, parse_mode="Markdown")
+    if update.message and update.message.text:
+        res = await handle_weather_logic(update.message.text.strip())
+        await update.message.reply_text(res, parse_mode="Markdown")
     return ConversationHandler.END
 
 
 async def handle_menu_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перехоплює кліки по інлайн-кнопках (міста та валюти)."""
     query = update.callback_query
     if not query or not query.message:
         return
-
     await query.answer()
 
-    action_data = query.data.split(":")
-    action_type = action_data[0]
-    value = action_data[1]
+    action_type, value = query.data.split(":")
 
     if action_type == "weather":
         response_text = await handle_weather_logic(value)
@@ -191,70 +126,60 @@ async def handle_menu_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE)
     elif action_type == "currency":
         cache_key = f"currency:{value.lower()}"
         cached_rate = get_cached_data(cache_key)
-        is_cached = False
+        is_cached = bool(cached_rate)
 
-        if cached_rate:
+        rate = None
+        if is_cached:
             rate = cached_rate
-            is_cached = True
         else:
             url = f"https://exchangerate-api.com{EXCHANGE_API_KEY}/pair/{value}/UAH"
             try:
-                res = requests.get(url)
-                if res.status_code == 200:
-                    rate = res.json().get("conversion_rate", "ошибка")
-                    set_cache_data(cache_key, rate)
-                else:
-                    rate = "ошибка"
+                async with httpx.AsyncClient() as client:
+                    res = await client.get(url, timeout=10.0)
+                    if res.status_code == 200:
+                        rate = res.json().get("conversion_rate")
+                        if rate:
+                            set_cache_data(cache_key, rate)
             except Exception:
-                rate = "ошибка"
+                rate = None
 
-        if rate == "ошибка":
-            await query.message.reply_text("⚠️ Не вдалося отримати курс валют. Спробуйте пізніше.")
+        if rate is None:
+            await query.message.reply_text("⚠️ Не вдалося отримати курс валют.")
             return
 
-        cache_tag = " ⚠️ *(Оновлено з кешу)*" if is_cached else ""
-        currency_signs = {"USD": "💵", "EUR": "💶"}
-        sign = currency_signs.get(value, "💰")
-
-        msg = f"{sign} **Курс обміну {value} до гривні (UAH){cache_tag}:**\n• 1 {value} = {rate:.2f} UAH"
+        cache_tag = " ⚠️ *(З кешу)*" if is_cached else ""
+        sign = {"USD": "💵", "EUR": "💶"}.get(value, "💰")
+        msg = f"{sign} **Курс {value} до гривні (UAH){cache_tag}:**\n• 1 {value} = {rate:.2f} UAH"
         await query.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Скасовує операцію введення міста."""
     if update.message:
         await update.message.reply_text("🚫 Запит скасовано.")
     return ConversationHandler.END
 
 
-def main() -> str | NoReturn:
-    """Запуск додатку та реєстрація обробників разом із фоновим таймером очищення."""
-    if not BOT_TOKEN or not WEATHER_API_KEY or not EXCHANGE_API_KEY:
-        logging.critical("Перевірте наявність усіх трьох ключів у файлі .env!")
-        return "Помилка конфігурації"
+app.add_handler(CommandHandler("start", start_command))
+app.add_handler(CallbackQueryHandler(handle_menu_clicks))
+app.add_handler(ConversationHandler(
+    entry_points=[CommandHandler("weather", weather_start)],
+    states={AWAITING_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_weather)]},
+    fallbacks=[CommandHandler("cancel", cancel_command)]
+))
 
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(clear_expired_cache_job, interval=600, first=10)
-        logging.info("Фоновий таймер очищення кешу успішно ініціалізовано.")
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(handle_menu_clicks))
-
-    weather_conversation = ConversationHandler(
-        entry_points=[CommandHandler("weather", weather_start)],
-        states={
-            AWAITING_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_weather)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel_command)]
-    )
-    app.add_handler(weather_conversation)
-
-    logging.info("Бот успішно запущений.")
-    app.run_polling()
+@flask_app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def telegram_webhook():
+    """Приймає HTTP-запити від Telegram та передає їх асинхронному додатку бота."""
+    update_data = request.get_json()
+    if update_data:
+        update = Update.de_json(update_data, app.bot)
+        asyncio.run(app.process_update(update))
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
-    main()
+    if not BOT_TOKEN or not WEATHER_API_KEY or not EXCHANGE_API_KEY:
+        print("Помилка конфігурації: відсутні ключі в .env")
+    else:
+        flask_app.run(port=5000)
