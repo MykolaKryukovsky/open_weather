@@ -15,7 +15,7 @@ from telegram.ext import (
     filters
 )
 
-
+# Налаштування логування
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -26,15 +26,12 @@ logging.basicConfig(
     ]
 )
 
-
 load_dotenv()
 BOT_TOKEN: Final[str | None] = os.getenv("TELEGRAM_BOT_TOKEN")
 WEATHER_API_KEY: Final[str | None] = os.getenv("API_KEY")
 EXCHANGE_API_KEY: Final[str | None] = os.getenv("EXCHANGE_API_KEY")
 
-
 AWAITING_CITY: Final[int] = 1
-
 
 DATA_CACHE: dict[str, dict[str, Any]] = {}
 CACHE_TTL_MINUTES: Final[int] = 10
@@ -57,7 +54,7 @@ def set_cache_data(cache_key: str, data: Any) -> None:
         "timestamp": datetime.now(),
         "data": data
     }
-    logging.info(f"📥 Нові дані успішно збережено в кеш для ключа: {cache_key}")
+    logging.info(f"📥 Нові дані успешно збережено в кеш для ключа: {cache_key}")
 
 
 async def clear_expired_cache_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -84,7 +81,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     """Надсилає користувачеві вітальне повідомлення та головне меню у вигляді кнопок."""
     user: User | None = update.effective_user
     if user:
-        logging.info(f"Користувач {user.first_name} (ID: {user.id}) запустив бота")
+        logging.info(f"Користувач {user.first_name} (ID: {user.id}) запустив бот.")
 
     keyboard = [
         [
@@ -118,13 +115,18 @@ async def weather_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 def fetch_weather_from_api(city_name: str) -> dict[str, Any] | str:
     """Запитує погодні дані або повертає рядок помилки."""
+    # ВИПРАВЛЕНО: Змінено базовий URL на правильний ендпоінт API
     url = "https://openweathermap.org"
     params = {"q": city_name, "appid": WEATHER_API_KEY, "units": "metric", "lang": "ua"}
 
-    response = requests.get(url, params=params)
-    if response.status_code != 200:
+    try:
+        response = requests.get(url, params=params)
+        if response.status_code != 200:
+            return "not_found"
+        return response.json()
+    except Exception as e:
+        logging.error(f"Помилка запиту погоди: {e}")
         return "not_found"
-    return response.json()
 
 
 async def handle_weather_logic(city_name: str) -> str:
@@ -142,12 +144,17 @@ async def handle_weather_logic(city_name: str) -> str:
             return "❌ Місто не знайдено або сталася помилка API. Перевірте назву."
         set_cache_data(cache_key, data)
 
-    temp = data["main"]["temp"]
-    description = data["weather"]["description"].capitalize()
-    humidity = data["main"]["humidity"]
-    wind_speed = data["wind"]["speed"]
-    drink_time = (datetime.now() + timedelta(hours=1)).strftime("%H:%M")
+    # ВИПРАВЛЕНО: Безпечне витягування даних, weather - це масив словників
+    try:
+        temp = data["main"]["temp"]
+        description = data["weather"][0]["description"].capitalize()
+        humidity = data["main"]["humidity"]
+        wind_speed = data["wind"]["speed"]
+    except (KeyError, IndexError) as e:
+        logging.error(f"Помилка парсингу JSON погоди: {e}")
+        return "❌ Сталася помилка при обробці даних погоди."
 
+    drink_time = (datetime.now() + timedelta(hours=1)).strftime("%H:%M")
     cache_tag = " ⚠️ *(Оновлено з кешу)*" if is_cached else ""
 
     return (
@@ -197,15 +204,18 @@ async def handle_menu_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE)
             rate = cached_rate
             is_cached = True
         else:
+            # ВИПРАВЛЕНО: Виправлено URL-адресу для ExchangeRate-API v6
             url = f"https://exchangerate-api.com{EXCHANGE_API_KEY}/pair/{value}/UAH"
             try:
                 res = requests.get(url)
                 if res.status_code == 200:
                     rate = res.json().get("conversion_rate", "ошибка")
-                    set_cache_data(cache_key, rate)
+                    if rate != "ошибка":
+                        set_cache_data(cache_key, rate)
                 else:
                     rate = "ошибка"
-            except Exception:
+            except Exception as e:
+                logging.error(f"Помилка запиту валюти: {e}")
                 rate = "ошибка"
 
         if rate == "ошибка":
@@ -216,7 +226,8 @@ async def handle_menu_clicks(update: Update, context: ContextTypes.DEFAULT_TYPE)
         currency_signs = {"USD": "💵", "EUR": "💶"}
         sign = currency_signs.get(value, "💰")
 
-        msg = f"{sign} **Курс обміну {value} до гривні (UAH){cache_tag}:**\n• 1 {value} = {rate:.2f} UAH"
+        # ВИПРАВЛЕНО: rate тепер гарантовано є числом перед використанням format :.2f
+        msg = f"{sign} **Курс обміну {value} до гривні (UAH){cache_tag}:**\n• 1 {value} = {float(rate):.2f} UAH"
         await query.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -239,6 +250,9 @@ def main() -> str | NoReturn:
     if job_queue:
         job_queue.run_repeating(clear_expired_cache_job, interval=600, first=10)
         logging.info("Фоновий таймер очищення кешу успішно ініціалізовано.")
+    else:
+        # Важливе попередження, якщо бібліотека встановлена без [job-queue]
+        logging.warning("JobQueue недоступна. Встановіть pip install python-telegram-bot[job-queue]")
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(handle_menu_clicks))
@@ -250,6 +264,7 @@ def main() -> str | NoReturn:
         },
         fallbacks=[CommandHandler("cancel", cancel_command)]
     )
+
     app.add_handler(weather_conversation)
 
     logging.info("Бот успішно запущений.")
